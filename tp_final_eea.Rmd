@@ -1,0 +1,739 @@
+---
+title: "Trabajo final EEA"
+output: 
+  html_notebook: 
+    toc: yes
+    toc_float: true
+---
+
+# Objetivo
+
+Aplicar un modelo de regresión logística sobre el dataset de colegios, realizando un análisis estadístico durante la metodología y en los resultados obtenidos.
+
+Correr un modelo de regresión logística que pueda predecir el estado (activo o inactivo) de un colegio, en función del resto de las variables.
+
+# Librerías
+
+```{r}
+library(tidyr)
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(GGally)
+library(modelr)
+library(purrr) # Para la función map (como el apply)
+library(tidymodels)
+library(cowplot) # Para plot_grid
+library(pROC) # Para roc
+library(caret) # Para confusionMatrix
+```
+
+# Dataset
+
+El dataset a utilizar proviene del trabajo en el que me desempeño actualmente. Es un dataset que muestra información sobre la interacción de los estudiantes y la plataforma educativa utilizada en el trabajo.
+
+Los colegios contratan los servicios de la empresa, que les provee una plataforma web a la que se conectan docentes y estudiantes. La plataforma les sirve como herramienta para impartir contenidos, tareas y ejercicios. Tiene algunas semejanzas con el campus de la maestría, pero está dirigido para estudiantes de primaria y secundaria.
+
+```{r}
+data_seleccionada <- read.csv("C:/Users/jgaricoche/Downloads/data_tp_eea.csv")
+
+data_seleccionada %>% head(30)
+```
+
+```{r}
+paste("Cantidad de filas del dataset original:", nrow(data_seleccionada))
+paste("Cantidad de variables del dataset original:", ncol(data_seleccionada))
+```
+
+
+Cambio el nombre de las variables colegios
+
+```{r}
+variables_relevantes <- dput(names(data_seleccionada))
+
+variables_relevantes <- str_replace_all(variables_relevantes, "colegios_rpt_colegios_current_", "colegios_")
+names(data_seleccionada) <- variables_relevantes
+
+rm(variables_relevantes)
+```
+
+# Descripción inicial y selección de variables
+
+El dataset tiene información sobre la interacción de los estudiantes con una plataforma educativa. Cada registro identifica a un estudiante en una clase impartida en la plataforma.
+
+```{r}
+paste("Cantidad de colegios en el dataset:", data_seleccionada %>% select(clases_id_colegio_curso) %>% distinct() %>% nrow())
+```
+
+Existen 67 colegios distintos, sobre los que se va a determinar si su estado es Activo o Inactivo, basado en una colección de variables explicativas.
+
+```{r}
+paste ("Cantidad de colegios activos:", data_seleccionada %>% filter(colegios_estado_colegio=="Activo") %>% select(clases_id_colegio_curso) %>% distinct() %>% nrow())
+paste("Cantidad de colegios inactivos:", data_seleccionada %>% filter(colegios_estado_colegio=="Inactivo") %>% select(clases_id_colegio_curso) %>% distinct() %>% nrow())
+```
+
+Del total de colegios, el 83,6% está activo, mientras que el 16,4% restante se encuentra en estado inactivo. Como el dataset está desbalanceado, voy a aplicar un método de balanceo antes de entrenar el modelo de regresión logística.
+
+A continuación, se realiza un listado de las variables del dataset, con una breve descripción de cada una:
+
+  * estudiantes_id_usuario: Identificador de cada estudiante.
+  * estudiantes_codigo_clase: Identificador de cada clase.
+  * estudiantes_nu_contenidos_asignados: Cantidad de contenidos asignados al estudiante en la clase.
+  * estudiantes_fc_inicio_ultimo_contenido_asignado: Fecha de inicio del último contenido asignado al estudiante en la clase.
+  * estudiantes_fc_vencimiento_primer_contenido_vencido: Fecha de vencimiento del primer contenido vencido asignado al estudiante en la clase.
+  * estudiantes_fc_vencimiento_ultimo_contenido_vencido: Fecha de vencimiento del último contenido vencido asignado al estudiante en la clase.
+  * estudiantes_nu_total_minutos_dedicados: Tiempo dedicado por el estudiante en la clase, trackeado en la plataforma. Medido en minutos.
+  * estudiantes_promedio_progreso_clase: Promedio de progreso del estudiante en todos los contenidos que se le asignaron en la clase.
+  * clases_asignatura: Nombre de la asignatura
+  * clases_prim_sec: Indica si la clase es de primaria o de secundaria.
+  * clases_user_tutor: Nombre de usuario del tutor asignado a la clase.
+  * clases_id_colegio_curso: Identificador del colegio.
+  * colegios_provincia: Provincia a la que pertenece el colegio.
+  * colegios_tipo_contrato_2: Contrato público o privado.
+  * colegios_onboarding_activado: Indica si el proceso de onboarding (tutoriales para usar la plataforma) con el equipo de operaciones fue iniciado.
+  * colegios_estado_colegio: Indica si el colegio está Activo o Inactivo. Es la variable a predecir.
+  * colegios_entorno_colegio: Indica si el ambiente productivo en el que se desarrolló la plataforma es "Beta" (primera versión, y con errores más frecuentes) o "Colegios" (ambiente al que migraron todas las cuentas).
+  * colegios_meses_desde_alta_colegio: Meses desde que el colegio fue dado de alta para utilizar la plataforma.
+  * colegios_tipo_integracion: Indica si la plataforma fue integrada con otras plataformas existentes como Google Classroom o Moodle.
+
+Todas las variables descriptas van a ser utilizadas para intentar predecir actividad/inactividad de un colegio.
+
+# Ingenería de features
+
+Para intentar clasificar a aquellos colegios que se encuentran en estado inactivo, voy a crear variables que considero que pueden ser buenas predictoras.
+
+Como el dataset registra métricas sobre los estudiantes en las clases, voy a necesitar agrupar para obtener estadísticas sobre los colegios, que son las entidades sobre las que quiero predecir la actividad/inactividad.
+
+Observación:
+
+  * Estoy agregando a "estudiantes_fc_inicio_ultimo_contenido_asignado". Asumo que agregarla no es cometer data leakage. La variable puede dar una pista sobre la actividad de cada colegio. Porque si la fecha de inicio del último contenido asignado en un curso es muy lejana de la fecha actual, eso implica que el colegio no muestra actividad hace tiempo. Por lo tanto, las probabilidades de que sea un inactivo son mayores. Como es una probabilidad y no una certeza, lo tomo como otra variable predictora, ya que contribuye a explicar la actividad/inactividad de un colegio, sin necesariamente implicar data leakage.
+
+Utilizo las variables con formato fecha para medir la cantidad de días desde la fecha. Además, agrego la variable "cant_dias_entre_contenidos", que mide la cantidad de días que transcurrieron desde el vencimiento del primer contenido hasta el vencimiento del último contenido.
+
+Además, creo una variable que indique si una clase tiene tutor o no. Y creo una variable que flaguee si una clase es de primaria.
+
+```{r}
+data_seleccionada <- data_seleccionada %>% 
+  mutate(dias_desde_inicio_ultimo_contenido = interval(ymd(estudiantes_fc_inicio_ultimo_contenido_asignado),ymd(today())) %/% days(1),
+         dias_desde_venc_primer_contenido = interval(ymd(estudiantes_fc_vencimiento_primer_contenido_vencido),ymd(today())) %/% days(1),
+         dias_desde_venc_ultimo_contenido = interval(ymd(estudiantes_fc_vencimiento_ultimo_contenido_vencido),ymd(today())) %/% days(1),
+         cant_dias_entre_contenidos = dias_desde_venc_primer_contenido - dias_desde_venc_ultimo_contenido,
+         tiene_tutor = case_when(clases_user_tutor !="Sin Tutor Asignado" ~ 1, TRUE ~ 0),
+         es_primaria = case_when(clases_prim_sec == "Primaria" ~ 1, TRUE ~ 0)) %>% 
+  select(-c("estudiantes_fc_inicio_ultimo_contenido_asignado", 
+            "estudiantes_fc_vencimiento_primer_contenido_vencido", 
+            "estudiantes_fc_vencimiento_ultimo_contenido_vencido",
+            "clases_user_tutor",
+            "clases_prim_sec"))
+```
+
+Variables de agregación que debería incluir:
+
+  * Cantidad de estudiantes
+  * Cantidad de clases
+
+Algunas variables las tengo que agrupar por clase, primero.
+
+Por ejemplo, para conocer la cantidad total de contenidos asignados, primero debo saber cuántos contenidos se asignaron en cada clase. Si no agrupo, voy a estar contabilizando varias veces al mismo número de contenidos asignados, una por cada estudiante de la clase. En la realidad, a todos los estudiantes de la misma clase les fueron asignados la misma cantidad de contenidos.
+
+Al agrupar primero por clase, antes de agrupar por colegio, evito que las clases que tengan mayor cantidad de estudiantes tengan mayor peso en el cálculo de las métricas por colegio. En cambio, con otras variables como "cantidad de estudiantes" es preferible agrupar directamente por colegio, sin agrupar por clase previamente.
+
+```{r}
+clases <- data_seleccionada %>% 
+  group_by(estudiantes_codigo_clase) %>% 
+  summarise(nu_contenidos_asignados = max(estudiantes_nu_contenidos_asignados),
+            promedio_dias_desde_inicio_ultimo_contenido = mean(dias_desde_inicio_ultimo_contenido),
+            promedio_dias_desde_venc_primer_contenido = mean(dias_desde_venc_primer_contenido),
+            promedio_dias_desde_venc_ultimo_contenido = mean(dias_desde_venc_ultimo_contenido),
+            promedio_dias_entre_contenidos = mean(cant_dias_entre_contenidos),
+            es_primaria = max(es_primaria),
+            tiene_tutor = max(tiene_tutor),
+            id_colegio = max(clases_id_colegio_curso)
+            )
+```
+
+Luego de agrupar por clase, agrupo por colegio.
+
+```{r}
+colegios_clases <- clases %>% 
+  group_by(id_colegio) %>% 
+  summarise(nu_contenidos_asignados = mean(nu_contenidos_asignados),
+            promedio_dias_desde_inicio_ultimo_contenido = mean(promedio_dias_desde_inicio_ultimo_contenido),
+            promedio_dias_desde_venc_primer_contenido = mean(promedio_dias_desde_venc_primer_contenido),
+            promedio_dias_desde_venc_ultimo_contenido = mean(promedio_dias_desde_venc_ultimo_contenido),
+            promedio_dias_entre_contenidos = mean(promedio_dias_entre_contenidos),
+            proporcion_primaria = sum(es_primaria)/n(),
+            proporcion_tiene_tutor = sum(tiene_tutor)/n())
+```
+
+Agrupo por colegio el resto de las variables que no fueron agrupadas por clase previamente.
+
+```{r}
+colegios_data <- data_seleccionada %>% 
+  group_by(clases_id_colegio_curso) %>% 
+  summarise(cantidad_estudiantes = n_distinct(estudiantes_id_usuario),
+            cantidad_clases = n_distinct(estudiantes_codigo_clase),
+            promedio_tiempo_dedicado = mean(estudiantes_nu_total_minutos_dedicados),
+            promedio_progreso = mean(estudiantes_promedio_progreso_clase),
+            cantidad_asignaturas = n_distinct(clases_asignatura),
+            provincia = max(colegios_provincia),
+            tipo_contrato = max(colegios_tipo_contrato_2),
+            onboarding_activado = max(colegios_onboarding_activado),
+            estado = max(colegios_estado_colegio),
+            entorno = max(colegios_entorno_colegio),
+            meses_desde_alta = max(colegios_meses_desde_alta_colegio),
+            tipo_integracion = max(colegios_tipo_integracion)
+            )
+```
+
+Realizo un join para quedarme con el dataset final
+
+```{r}
+colegios <- colegios_clases %>% inner_join(colegios_data, by = c("id_colegio"="clases_id_colegio_curso"))
+```
+
+Limpio
+
+```{r}
+rm(colegios_clases, colegios_data, clases, data_seleccionada)
+```
+
+
+El dataset final cuenta por una fila por cada colegio. Las variables agregadas fueron las siguientes:
+
+  * promedio_dias_entre_contenidos: Para cada colegio, realiza un promedio entre todas las clases, calculando para cada una de ellas la cantidad de días transcurridos entre el vencimiento del primer contenido y el vencimiento del último contenido. Es una medida de la duración promedio de las clases.
+  * Las variables "tiene_tutor" y "primaria" miden la proporción de clases con tutores y clases con primaria, respectivamente, que hay en cada colegio.
+
+# Análisis exploratorio
+
+## Veo correlaciones entre variables
+
+```{r warning=FALSE}
+colegios_ggpairs <- colegios %>% 
+  select(promedio_dias_entre_contenidos, 
+                                        nu_contenidos_asignados, 
+                                        proporcion_primaria, 
+                                        proporcion_tiene_tutor, 
+                                        cantidad_clases, 
+                                        cantidad_asignaturas, 
+                                        promedio_progreso, 
+                                        promedio_tiempo_dedicado, 
+                                        entorno, 
+                                        tipo_contrato, 
+                                        onboarding_activado, 
+                                        estado) %>% 
+  mutate(onboarding_activado = as.factor(onboarding_activado))
+
+ggpairs(data = colegios_ggpairs, 
+        mapping = aes(colour = estado), 
+        upper = list(continuous = wrap("cor", size = 3, hjust=0.5)), 
+        title = "Matriz de correlaciones", 
+        legend = 1, progress = FALSE) + 
+  theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+Se pueden hacer varias observaciones del ggpairs:
+
+  * Las variables "cantidad_asignaturas" y "cantidad_clases" están fuertemente correlacionadas. Esto se debe a que generalmente una clase (indicado mediante un código) dicta una única materia (indicada mediante un nombre). Por lo tanto, al observar la cantidad de clases y materias en un colegio, generalmente coinciden. Teniendo en cuenta esto, tal vez conviene seleccionar una de las dos variables para los modelos. Notar que las correlaciones difieren drásticamente, dependiendo si se trata de colegios activos o inactivos.
+  * Existe una correlación relativamente alta y positiva entre "nu_contenidos_asignados" y "promedio_dias_entre_contenidos". Es decir que, si transcurrió mucho tiempo entre el primer contenido vencido y el último contenido vencido, es posible que la cantidad de contenidos asignados sea elevada también.
+  * Notar que, en general, los colegios inactivos muestran mayor cantidad de contenidos asignados, cantidad de clases y asignaturas que los colegios activos.
+
+## Analizo la variable provincia:
+
+```{r}
+provincias <- colegios %>% 
+  group_by(provincia) %>% 
+  summarise(cantidad = n()) %>% 
+  mutate(proporcion = round ( cantidad/sum(cantidad), 2)) %>% 
+  arrange(desc(cantidad))
+
+ggplot(data = provincias, aes(x = reorder(provincia, -cantidad), y = cantidad))+
+  geom_col()+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))+
+  xlab("Provincia")+
+  ylab("Cantidad")+
+  ggtitle("Cantidad de colegios por provincia")
+```
+
+Como hay gran cantidad de provincias que tienen un único colegio, voy a transformar la variable provincias y agrupar todas las provincias con menor cantidad de colegios en una única categoría.
+
+```{r}
+provincias_quedan <- c("San Juan", "Buenos Aires", "Chubut", "Mendoza", "Ciudad de Buenos Aires")
+
+colegios <- colegios %>% 
+  mutate(provincia = case_when(!provincia %in% provincias_quedan ~ "Otras", TRUE ~ provincia ))
+```
+
+Grafico nuevamente
+
+```{r}
+provincias <- colegios %>% 
+  group_by(provincia) %>% 
+  summarise(cantidad = n()) %>% 
+  mutate(proporcion = round ( cantidad/sum(cantidad), 2)) %>% 
+  arrange(desc(cantidad))
+
+ggplot(data = provincias, aes(x = reorder(provincia, -cantidad), y = cantidad))+
+  geom_col()+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))+
+  xlab("Provincia")+
+  ylab("Cantidad")+
+  ggtitle("Cantidad de colegios por provincia")
+```
+Limpio
+
+```{r}
+rm(provincias, provincias_quedan)
+```
+
+## Analizo la variable tipo de integración:
+
+```{r}
+integraciones <- colegios %>% 
+  group_by(tipo_integracion) %>% 
+  summarise(cantidad = n()) %>% 
+  mutate(proporcion = round ( cantidad/sum(cantidad), 2)) %>% 
+  arrange(desc(cantidad))
+
+ggplot(data = integraciones, aes(x = reorder(tipo_integracion, -cantidad), y = cantidad))+
+  geom_col()+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))+
+  xlab("Tipo de integración")+
+  ylab("Cantidad")+
+  ggtitle("Cantidad de colegios por cada tipo de integración")
+```
+
+Le cambio el nombre a la categoría "sin integración"
+
+```{r}
+colegios <- colegios %>% mutate(tipo_integracion = case_when(tipo_integracion=='[S/Integración]' ~ "Sin integración", TRUE ~ tipo_integracion))
+```
+
+Junto en una única variable las categorías con pocos colegios
+
+```{r}
+integraciones_quedan <- c("Classroom", "Sin integración")
+
+colegios <- colegios %>% 
+  mutate(tipo_integracion = case_when(!tipo_integracion %in% integraciones_quedan ~ "Otras", TRUE ~ tipo_integracion ))
+```
+
+Grafico nuevamente
+
+```{r}
+integraciones <- colegios %>% 
+  group_by(tipo_integracion) %>% 
+  summarise(cantidad = n()) %>% 
+  mutate(proporcion = round ( cantidad/sum(cantidad), 2)) %>% 
+  arrange(desc(cantidad))
+
+ggplot(data = integraciones, aes(x = reorder(tipo_integracion, -cantidad), y = cantidad))+
+  geom_col()+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle = 45, hjust=1))+
+  xlab("Tipo de integración")+
+  ylab("Cantidad")+
+  ggtitle("Cantidad de colegios por cada tipo de integración")
+```
+
+Limpio
+
+```{r}
+rm(integraciones, integraciones_quedan)
+```
+
+## Veo el histograma de algunas variables continuas
+
+```{r}
+ggplot(data = colegios, aes(x = promedio_dias_entre_contenidos))+
+  geom_histogram(binwidth = 10)+
+  ggtitle("Histograma promedio de días entre contenidos")+
+  xlab("")+ylab("")
+
+ggplot(data = colegios, aes(x = nu_contenidos_asignados))+
+  geom_histogram(binwidth = 0.5)+
+  ggtitle("Histograma cantidad de contenidos asignados")+
+  xlab("")+ylab("")
+
+ggplot(data = colegios, aes(x = meses_desde_alta))+
+  geom_histogram(binwidth = 1)+
+  ggtitle("Histograma meses desde alta")+
+  xlab("")+ylab("")
+```
+
+Las variables presentadas muestran heterogeneidad en sus distribuciones.
+
+  * El promedio de días entre contenidos muestra una distribución sesgada a derecha. Hay muchos colegios que toman el valor cero para esta variable, mientras que existen valores extremos, de colegios cuya diferencia promedio entre el primer y último contenido es elevada.
+  * La distribución de la cantidad de contenidos asignados está levemente sesgada hacia la derecha, pero muestra una simetría mayor que la distribución anterior. Esta variable toma pocos valores, ya que los contenidos asignados para cada clase generalmente tienen una duración de meses, y no es usual asignar gran cantidad de contenidos para una misma clase.
+  * La variable meses desde alta muestra una distribución bimodal, con un máximo en 20 meses y un mínimo en 11.
+
+Limpio
+```{r}
+rm(colegios_ggpairs)
+```
+
+# División en train y test
+
+Paso la variable objetivo a valores numéricos
+
+```{r}
+colegios_modelo <- colegios %>% 
+  mutate(estado = case_when(estado=="Activo" ~ 1, TRUE ~ 0))
+```
+
+Seteo semilla
+
+```{r}
+#set.seed(19950531) # La fecha de mi cumpleaños, por si me quieren regalar algo :)
+set.seed(1995)
+```
+
+Divido en particiones
+
+```{r}
+train_test <- initial_split(colegios_modelo, prop = 0.85)
+train_data <- training(train_test)
+test_data <- testing(train_test)
+```
+
+Dimensiones de cada partición
+
+```{r}
+paste("Cantidad de colegios en dataset de training:",
+train_data %>%
+  nrow() )
+
+paste("Cantidad de colegios en dataset de test:",
+test_data %>%
+  nrow() )
+```
+
+Proporciones de positivos en cada partición
+
+```{r}
+paste("Test:", round(test_data %>% filter(estado=="1") %>% nrow() /nrow(test_data), 2))
+paste("Train:", round(train_data %>% filter(estado=="1") %>% nrow() /nrow(train_data), 2))
+```
+
+# Modelo
+
+Para tratar el desbalanceo de clases, aplico oversampling de la clase minoritaria (Inactivo). Le voy a aplicar un peso de 1.2 a la clase minoritaria
+
+```{r}
+train_data <- train_data %>% mutate(pesos = case_when(estado==0 ~ 1.2, TRUE ~ 1))
+```
+
+Armo tres modelos de regresión con distinta combinación de variables.
+
+## Analizo todos los modelos juntos
+
+```{r}
+formulas <- modelr::formulas(.response = ~ estado, 
+                             modelo1 = ~ onboarding_activado + 
+                               nu_contenidos_asignados+ 
+                               proporcion_primaria+ 
+                               proporcion_tiene_tutor+ 
+                               cantidad_asignaturas+ 
+                               promedio_progreso+ 
+                               promedio_tiempo_dedicado+ 
+                               entorno+ 
+                               tipo_contrato,
+                             modelo2 = ~ nu_contenidos_asignados+
+                               tipo_contrato+
+                               cantidad_asignaturas,
+                             modelo3 = ~ nu_contenidos_asignados+ promedio_dias_desde_inicio_ultimo_contenido+ 
+promedio_dias_desde_venc_primer_contenido+ promedio_dias_desde_venc_ultimo_contenido+ 
+promedio_dias_entre_contenidos+ proporcion_primaria+ proporcion_tiene_tutor+ 
+cantidad_estudiantes+ promedio_tiempo_dedicado+ 
+promedio_progreso+ cantidad_asignaturas+ provincia+ tipo_contrato+entorno+ onboarding_activado+meses_desde_alta+ tipo_integracion)
+```
+
+Los modelos elegidos son los siguientes:
+
+  * En modelo 1 se eligieron aquellas variables que presentan mayor interpretación lógica desde el negocio. Aquellas variables sobre las que hay un interés en el negocio para estudiar su posible efecto sobre la variable respuesta.
+  * En el modelo 2 se incluyeron un número limitado de variables, para intentar obtener una interpretación más simple del modelo.
+  * En el modelo 3 se incluyeron todas las variables disponibles.
+
+Instancio los modelos.
+
+```{r}
+modelos <- data_frame(formulas) %>%
+  mutate(modelos = names(formulas),
+         expression = paste(formulas),
+         mod = map(formulas, ~glm(., family = 'binomial', data = train_data, weights = pesos)))
+
+modelos
+```
+
+Creo las medidas de evaluación.
+
+```{r}
+modelos <- modelos %>% 
+  mutate(glance = map(mod,glance))
+# Obtener las medidas de evaluacion de interés
+modelos %>% 
+  unnest(glance) %>%
+  # Calculamos la deviance explicada
+  mutate(perc_explained_dev = 1-deviance/null.deviance) %>% 
+  select(-c(df.null, AIC, BIC)) %>% 
+  arrange(deviance)
+```
+
+Notar que el modelo 3, que incluye todas las variables posibles, obtiene un porcentaje de deviance explicada igual a uno. Es muy probable que se trate de un modelo que overfittea.
+El modelo 2, que incluye las tres variables que consideré más relevantes, obtiene una métrica de deviance menor que el modelo 1, que incluye más variables.
+
+Genero las predicciones.
+
+```{r}
+modelos <- modelos %>% 
+  mutate(pred= map(mod, augment, type.predict = "response"))
+```
+
+Guardo las predicciones
+
+```{r}
+predicciones_modelo1 <- modelos %>% 
+  filter(modelos=="modelo1") %>% 
+  unnest(pred)
+
+predicciones_modelo2 <- modelos %>% 
+  filter(modelos=="modelo2") %>% 
+  unnest(pred)
+
+predicciones_modelo3 <- modelos %>% 
+  filter(modelos=="modelo3") %>% 
+  unnest(pred)
+```
+
+# Evaluación
+
+Visualizo las predicciones para el modelo 1.
+
+```{r}
+modelos$pred$modelo1 %>% arrange(.fitted)
+```
+
+```{r}
+paste("Mínima probabilidad asignada por el modelo 1: ", round(min(predicciones_modelo1$.fitted), 2))
+paste("Mínima probabilidad asignada por el modelo 2: ", round(min(predicciones_modelo2$.fitted), 2))
+paste("Mínima probabilidad asignada por el modelo 3: ", round(min(predicciones_modelo3$.fitted), 2))
+```
+
+Notar que las probabilidades más bajas que alcanza el modelo 1 son de 0.27, lo que implica que no se cubre el rango completo de posibilidades. Algo similar sucede con el modelo 2. Por lo que cualquier punto de corte que quiera predecir alguna observación como "Inactivo" (negativo) debe ser al menos superior a las mínimas probabilidades otorgadas por cada modelo.
+
+## Gráfico de violín
+
+```{r}
+violin_modelo1 = ggplot(predicciones_modelo1, aes(x=estado, y=.fitted, group=estado, fill=factor(estado))) + 
+  geom_violin() +
+  theme_bw() +
+  guides(scale="none") +
+  labs(title='Violin plot', subtitle='Modelo 1', y='Predicted probability')
+
+violin_modelo2 = ggplot(predicciones_modelo2, aes(x=estado, y=.fitted, group=estado, fill=factor(estado))) + 
+  geom_violin() +
+  theme_bw() +
+  guides(scale="none") +
+  labs(title='Violin plot', subtitle='Modelo 2', y='Predicted probability')
+
+violin_modelo3 = ggplot(predicciones_modelo3, aes(x=estado, y=.fitted, group=estado, fill=factor(estado))) + 
+  geom_violin() +
+  theme_bw() +
+  guides(scale="none") +
+  labs(title='Violin plot', subtitle='Modelo 3', y='Predicted probability')
+
+plot_grid(violin_modelo1, violin_modelo2, violin_modelo3)
+```
+
+En los gráficos de violín se puede ver más claramente que el modelo 3 clasifica perfectamente. Pero eso también implica que tal vez tenga inconvenientes al intentar predecir observaciones de otro set de datos.
+
+El modelo 1 parece ser mejor predictor que el modelo 2, ya que diferencia mejor a las observaciones según su estado. Por ejemplo, el modelo 2 asigna una probabilidad mayor a 0.9 a colegios inactivos. En cambio, el modelo 1 no asigna probabilidades mayores a 0.87.
+
+Además, el modelo 2 no asigna probabilidades menores a 0.59 a colegios inactivos. Osea, colegios que deberían tener probabilidades mucho menores.
+
+```{r}
+paste("Máxima probabilidad otorgada por el modelo 1 a un colegio inactivo:", round(max(predicciones_modelo1 %>% filter(estado==0) %>% select(.fitted) %>% pull()), 2))
+paste("Mínima probabilidad otorgada por el modelo 1 a un colegio inactivo:", round(min(predicciones_modelo1 %>% filter(estado==0) %>% select(.fitted) %>% pull()), 2))
+```
+
+## Curva ROC
+
+```{r}
+roc_modelo1 <- roc(response=predicciones_modelo1$estado, predictor=predicciones_modelo1$.fitted)
+roc_modelo2 <- roc(response=predicciones_modelo2$estado, predictor=predicciones_modelo2$.fitted)
+roc_modelo3 <- roc(response=predicciones_modelo3$estado, predictor=predicciones_modelo3$.fitted)
+
+ggroc(list(Modelo1=roc_modelo1, Modelo2=roc_modelo2, Modelo3=roc_modelo3), size=1) + 
+  geom_abline(slope = 1, intercept = 1, linetype='dashed') +
+  theme_bw() + 
+  labs(title='Curvas ROC', color='Modelo')
+```
+En la curva ROC también se puede observar que el modelo 3 overfittea, ya que clasifica perfectamente a los colegios del set de entrenamiento. Más adelante debiera haber una caída en las métricas de evaluación de este modelo, al utilizarlo para predecir el set de testeo.
+
+Área bajo la curva (AUC)
+
+```{r}
+print(paste('AUC: Modelo 1:', round(roc_modelo1$auc,3)))
+print(paste('AUC: Modelo 2:', round(roc_modelo2$auc,3)))
+print(paste('AUC: Modelo 3:', round(roc_modelo3$auc,3)))
+```
+
+Analizo los posibles errores a cometer y los costos asociados a cada error:
+
+  * Predecir que un colegio vaya a estar inactivo cuando en realidad no lo esté. En este caso, la acción a realizar basada en la predicción es aumentar el seguimiento del colegio, consultando a los usuarios por posibles fallas en el producto que impliquen una mala experiencia. El costo asociado es un aumento de recursos humanos dedicados específicamente al colegio en particular.
+  * Predecir que un colegio vaya a estar activo cuando en realidad es un colegio que termina dándose de baja. En este caso, no se realiza ninguna acción preventiva, ya que se predice que el colegio va a continuar activo. Sin embargo, el costo asociado al error cometido por el modelo implica perder un contrato y, por ende, una pérdida de ganancia en el negocio.
+  
+Por lo tanto, al arbitrar entre errores, es preferible aumentar la cantidad de falsos positivos, si eso implica reducir la cantidad de falsos negativos. (Un caso positivo es considerado como un "Activo")
+
+```{r}
+prediction_metrics <- function(cutoff, predictions=predicciones_modelo1){
+  tab <- predictions %>% 
+    mutate(predicted_class = if_else(.fitted > cutoff, 1, 0),
+           Activo = factor(estado))
+  confusionMatrix(table(tab$predicted_class, tab$estado), positive = "1") %>%
+    tidy() %>%
+    select(term, estimate) %>%
+    filter(term %in% c('accuracy', 'sensitivity', 'specificity', 'precision')) %>%
+    mutate(cutoff = cutoff)
+}
+cutoffs = seq(0.3,0.95,0.01)
+logit_pred = map_df(cutoffs, prediction_metrics) %>% 
+  mutate(term = as.factor(term), estimate = round(estimate, 3))
+ggplot(logit_pred, aes(cutoff,estimate, group=term, color=term)) + geom_line(size=1) +
+  theme_bw() +
+  labs(title= 'Accuracy, Sensitivity, Specificity y Precision', subtitle= 'Modelo 1', color="")
+```
+
+Existe un trade-off entre la especificidad y la sensitividad del modelo.
+
+Si elegimos un cut-off lo suficientemente elevado, la especificidad va a aumentar, pero a costas de una menor sensibilidad. Sin embargo, dado lo dicho previamente, es preferible mantener un punto de corte relativamente alto, para asegurarnos realizar predicciones certeras sobre aquellos colegios que finalmente van a pasar a estar inactivos. Esto, como contrapartida, implica clasificar como inactivos, incorrectamente, a colegios que no lo sean. Pero, como mencioné anteriormente, el costo asociado a este error es menor que el costo asociado a perder un cliente.
+
+Notar que, en el modelo 1, si elegimos un punto de corte mayor a 0.819 nos aseguramos que todo colegio clasificado como positivo sea efectivamente positivo. Es decir, reducimos a cero la probabilidad de cometer el error más costoso. Evalúo qué sucede en el modelo 2:
+
+```{r}
+prediction_metrics <- function(cutoff, predictions=predicciones_modelo2){
+  tab <- predictions %>% 
+    mutate(predicted_class = if_else(.fitted > cutoff, 1, 0),
+           Activo = factor(estado))
+  confusionMatrix(table(tab$predicted_class, tab$estado), positive = "1") %>%
+    tidy() %>%
+    select(term, estimate) %>%
+    filter(term %in% c('accuracy', 'sensitivity', 'specificity', 'precision')) %>%
+    mutate(cutoff = cutoff)
+}
+cutoffs = seq(0.4,0.95,0.01)
+logit_pred = map_df(cutoffs, prediction_metrics) %>% 
+  mutate(term = as.factor(term), estimate = round(estimate, 3))
+ggplot(logit_pred, aes(cutoff,estimate, group=term, color=term)) + geom_line(size=1) +
+  theme_bw() +
+  labs(title= 'Accuracy, Sensitivity, Specificity y Precision', subtitle= 'Modelo 2', color="")
+```
+
+Para el modelo 2, se puede obtener una especificidad igual a uno, pero a costas de reducir drásticamente la sensitividad y el accuracy. Es decir, si quiero asegurarme de no clasificar como activos a colegios que en realidad son inactivos, entonces va a aumentar la cantidad de colegios clasificados como inactivos erróneamente.
+
+Por lo tanto, es preferible utilizar el modelo 1, asegurándose de determinar un punto de corte lo suficientemente alto como para evitar perder colegios por inactividad.
+
+Matriz de confusión
+
+```{r}
+cutoff <- 0.85
+
+predicciones_cuttof <- predicciones_modelo1 %>% 
+    mutate(predicted_class = if_else(.fitted > cutoff, 1, 0),
+           Activo = factor(estado))
+
+confusionMatrix(table(predicciones_cuttof$predicted_class, predicciones_cuttof$estado), positive = "1")
+```
+
+En la matriz de confusión se puede ver que solo un colegio fue predicho como activo cuando en realidad no lo fue. Por el otro lado, los niveles de sensitividad y accuracy se redujeron, debido a la alta exigencia en especificidad que pedimos. Se puede ver que la cantidad de colegios falsos negativos es alta, debido a la exigencia. Estos son colegios que deberían haber sido clasificados como activos, pero fueron clasificados, erróneamente, como inactivos.
+
+# Evaluación en test
+
+Instancia de los modelos por separado para poder evaluar el dataset de testeo.
+
+```{r}
+modelo1 <- glm(data = train_data,
+              estado ~ onboarding_activado +
+                nu_contenidos_asignados+
+                proporcion_primaria+
+                proporcion_tiene_tutor+
+                cantidad_asignaturas+
+                promedio_progreso+
+                promedio_tiempo_dedicado+
+                entorno+
+                tipo_contrato,
+              family = 'binomial')
+
+modelo2 <- glm(data = train_data,
+              estado ~ nu_contenidos_asignados+
+                tipo_contrato+
+                cantidad_asignaturas,
+              family = 'binomial')
+
+modelo3 <- glm(data = train_data,
+              estado ~ nu_contenidos_asignados+ promedio_dias_desde_inicio_ultimo_contenido+
+promedio_dias_desde_venc_primer_contenido+ promedio_dias_desde_venc_ultimo_contenido+
+promedio_dias_entre_contenidos+ proporcion_primaria+ proporcion_tiene_tutor+
+cantidad_estudiantes+ promedio_tiempo_dedicado+
+promedio_progreso+ cantidad_asignaturas+ provincia+ tipo_contrato+
+onboarding_activado+ entorno+ meses_desde_alta+ tipo_integracion,
+              family = 'binomial')
+```
+
+Realizo las predicciones en el set de testeo.
+
+## Modelo 1
+
+```{r}
+table_test = augment(x = modelo1, newdata=test_data, type.predict='response') 
+
+table_test = table_test %>% 
+  mutate(clase_predicha = if_else(.fitted>cutoff, 1, 0) %>% as.factor(), 
+         estado = factor(estado))
+```
+
+Curva ROC
+
+```{r}
+roc_test_1 <- roc(response=table_test$estado, predictor=table_test$.fitted)
+
+print(paste('AUC: Modelo 1:', round(roc_test_1$auc,3)))
+```
+
+El área bajo la curva se redujo considerablemente al evaluar el modelo en el set de testeo. Esto implica que el modelo tal vez no obtenga buenas predicciones frente a datos nuevos que se le presenten, como las obtenidas con el set de entrenamiento.
+
+## Modelo 3
+
+Voy a evaluar el modelo 3, que incluía todas las variables y que overfitteaba. Su desempeño debería ser considerablemente más bajo.
+
+```{r}
+table_test = augment(x = modelo3, newdata=test_data, type.predict='response') 
+
+table_test = table_test %>% 
+  mutate(clase_predicha = if_else(.fitted>cutoff, 1, 0) %>% as.factor(), 
+         estado = factor(estado))
+```
+
+Curva ROC
+
+```{r}
+roc_test_3 <- roc(response=table_test$estado, predictor=table_test$.fitted)
+
+print(paste('AUC: Modelo 3:', round(roc_test_3$auc,3)))
+```
+
+Notar que el área bajo la curva que deja el modelo tres se reduce considerablemente. Deja de predecir a la perfección, como hacía en el training set, para alcanzar un AUC levemente superior al modelo 1.
+
+# Conclusiones
+
+Hay varias conclusiones que se pueden realizar sobre el trabajo realizado:
+
+  * La cantidad de observaciones del dataset puede ser una limitación a la hora de entrenar los modelos. En los gráficos ROC se puede ver que las curvas pegan saltos discretos. Esto se debe a la poca cantidad de observaciones con la que se trabaja. A medida que el negocio crezca y se firmen nuevos contratos, los modelos van a ser más robustos.
+  * Si bien la cantidad de variables es elevada, tal vez sería de utilidad obtener variables que muestren una causalidad (analizado desde el negocio) más fuerte. Por ejemplo, se podría trabajar en conjunto con el área de Data Engineering para disponibilizar métricas que registren qué tan usada es la plataforma. Se podrían obtener métricas sobre la cantidad de docentes que asignaron contenidos frecuentemente, si utilizan la plataforma para otros contenidos como tareas y ejercicios, etc. Estas variables de interacción de los usuarios con la plataforma pueden ser métricas más confiables que estadísticas como la cantidad de estudiantes o cursos.
+  * El modelo de regresión logística es un modelo que puede obtener resultados de utilidad para la predicción de colegios inactivos. Sin bien las probabilidades asignadas a los colegios inactivos eran altas, un punto de corte lo suficientemente alto puede servir a mantener una especificidad elevada.
+  * Para que estos modelos de predicción sean de utilidad, es necesario que la información sobre la actividad/inactividad de un colegio sea de unos meses posterior al resto de la data. De esta manera, evitamos utilizar información con la que no contaríamos a la hora de intentar predecir aquellos colegios que van a estar inactivos dentro de unos meses.
